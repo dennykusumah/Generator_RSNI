@@ -1303,61 +1303,55 @@ def _cache_put(cache_key: str, translated: str, italic_terms: list[str]) -> None
         pass
 
 
-# Adaptive request controller: fast by default, slows only after provider/network
-# failures, then automatically returns to fast mode after successful requests.
+# Adaptive request controller
+# FAST adalah default. Mode adaptif HANYA diaktifkan setelah satu ELEMEN
+# benar-benar gagal setelah seluruh percobaan translate normal selesai.
+# Dua ELEMEN sukses berturut-turut langsung mengembalikan mode FAST.
 _TRANSLATE_GATE_LOCK = threading.Lock()
 _TRANSLATE_NEXT_REQUEST = 0.0
 _TRANSLATE_FAST_INTERVAL = 0.0
-_TRANSLATE_ADAPTIVE_INTERVAL = 0.55
-_TRANSLATE_ADAPTIVE_UNTIL = 0.0
+_TRANSLATE_ADAPTIVE_INTERVAL = 0.45
+_TRANSLATE_ADAPTIVE_ACTIVE = False
 _TRANSLATE_SUCCESS_STREAK = 0
 
-def _translation_gate_wait(extra_delay: float = 0.0) -> None:
+def _translation_gate_wait() -> None:
     global _TRANSLATE_NEXT_REQUEST
     with _TRANSLATE_GATE_LOCK:
+        adaptive = _TRANSLATE_ADAPTIVE_ACTIVE
+        if not adaptive:
+            return  # fast path: benar-benar tanpa cooldown/jitter buatan Engine 8
         now = time.monotonic()
-        adaptive = now < _TRANSLATE_ADAPTIVE_UNTIL
-        interval = _TRANSLATE_ADAPTIVE_INTERVAL if adaptive else _TRANSLATE_FAST_INTERVAL
         wait = max(0.0, _TRANSLATE_NEXT_REQUEST - now)
-        if wait:
+        if wait > 0:
             time.sleep(wait)
-        # In fast mode four workers can run almost concurrently. In adaptive
-        # mode requests are deliberately spaced to let the provider recover.
-        jitter = random.uniform(0.0, 0.025 if not adaptive else 0.08)
-        _TRANSLATE_NEXT_REQUEST = time.monotonic() + interval + extra_delay + jitter
+        _TRANSLATE_NEXT_REQUEST = time.monotonic() + _TRANSLATE_ADAPTIVE_INTERVAL
+
+def _translation_element_failed() -> None:
+    global _TRANSLATE_ADAPTIVE_ACTIVE, _TRANSLATE_SUCCESS_STREAK, _TRANSLATE_NEXT_REQUEST
+    with _TRANSLATE_GATE_LOCK:
+        _TRANSLATE_ADAPTIVE_ACTIVE = True
+        _TRANSLATE_SUCCESS_STREAK = 0
+        # Request berikutnya diberi jarak pendek; tidak ada cooldown panjang.
+        _TRANSLATE_NEXT_REQUEST = time.monotonic() + _TRANSLATE_ADAPTIVE_INTERVAL
+
+def _translation_element_succeeded() -> None:
+    global _TRANSLATE_ADAPTIVE_ACTIVE, _TRANSLATE_SUCCESS_STREAK, _TRANSLATE_NEXT_REQUEST
+    with _TRANSLATE_GATE_LOCK:
+        if not _TRANSLATE_ADAPTIVE_ACTIVE:
+            return
+        _TRANSLATE_SUCCESS_STREAK += 1
+        if _TRANSLATE_SUCCESS_STREAK >= 2:
+            _TRANSLATE_ADAPTIVE_ACTIVE = False
+            _TRANSLATE_SUCCESS_STREAK = 0
+            _TRANSLATE_NEXT_REQUEST = 0.0
 
 def _is_provider_failure(exc: Exception) -> bool:
     msg = str(exc).casefold()
-    # Validation failures caused by document/token content must not throttle
-    # every other worker. Only network/provider/rate-limit symptoms do.
-    provider_terms = (
+    return any(term in msg for term in (
         '429', 'too many', 'rate', 'timeout', 'timed out', 'connection',
         'remote', 'temporar', '503', '502', 'service unavailable',
         'request exception', 'proxy', 'ssl', 'captcha', 'blocked'
-    )
-    return any(term in msg for term in provider_terms)
-
-def _translation_gate_penalize(attempt: int, exc: Exception | None = None) -> None:
-    global _TRANSLATE_ADAPTIVE_UNTIL, _TRANSLATE_SUCCESS_STREAK, _TRANSLATE_NEXT_REQUEST
-    if exc is not None and not _is_provider_failure(exc):
-        return
-    # Short adaptive window instead of permanently slowing the whole document.
-    penalty = min(4.0, 0.9 + (0.65 * max(0, attempt - 1)))
-    with _TRANSLATE_GATE_LOCK:
-        now = time.monotonic()
-        _TRANSLATE_ADAPTIVE_UNTIL = max(_TRANSLATE_ADAPTIVE_UNTIL, now + penalty)
-        _TRANSLATE_NEXT_REQUEST = max(_TRANSLATE_NEXT_REQUEST, now + 0.30)
-        _TRANSLATE_SUCCESS_STREAK = 0
-
-def _translation_gate_success() -> None:
-    global _TRANSLATE_ADAPTIVE_UNTIL, _TRANSLATE_SUCCESS_STREAK, _TRANSLATE_NEXT_REQUEST
-    with _TRANSLATE_GATE_LOCK:
-        _TRANSLATE_SUCCESS_STREAK += 1
-        # As soon as normal responses are stable again, immediately restore
-        # fast mode rather than waiting for a long fixed cooldown.
-        if _TRANSLATE_SUCCESS_STREAK >= 2:
-            _TRANSLATE_ADAPTIVE_UNTIL = 0.0
-            _TRANSLATE_NEXT_REQUEST = min(_TRANSLATE_NEXT_REQUEST, time.monotonic() + _TRANSLATE_FAST_INTERVAL)
+    ))
 
 _ENGLISH_RESIDUAL_PHRASES = (
     'these can be', 'these dapat be', 'can be represented', 'be represented by',
@@ -1443,7 +1437,7 @@ class _Translator:
         }
         result = None
         last_error = None
-        for attempt in range(1, 8):
+        for attempt in range(1, 5):
             try:
                 _translation_gate_wait()
                 candidate = self._client.translate(t)
@@ -1467,24 +1461,16 @@ class _Translator:
                 if _translation_has_residual_english(t, candidate):
                     raise ValueError('hasil masih mengandung residu bahasa Inggris')
                 result = candidate
-                _translation_gate_success()
                 break
             except Exception as exc:
                 last_error = exc
-                _translation_gate_penalize(attempt, exc)
-                # Buat ulang client setelah respons gagal/rate-limit agar
-                # koneksi/session bermasalah tidak dipakai terus-menerus.
+                # Retry elemen ini segera. Kegagalan satu REQUEST belum
+                # mengaktifkan adaptive/cooldown global. Adaptive baru aktif
+                # bila ELEMEN ini tetap gagal setelah seluruh percobaan.
                 try:
                     self._client = self._cls(source=self.source, target=self.target)
                 except Exception:
                     pass
-                if attempt < 7:
-                    if _is_provider_failure(exc):
-                        time.sleep(min(3.5, 0.45 * (2 ** (attempt - 1))) + random.uniform(0.05, 0.25))
-                    else:
-                        # Content/token validation error: retry quickly and do
-                        # not punish unrelated workers.
-                        time.sleep(0.08 + random.uniform(0.0, 0.08))
 
         if result is None:
             # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
@@ -2090,8 +2076,10 @@ class DocxFinalTranslatorEngine:
                     italic_count += len(found)
                     if failed:
                         failed_paras.append((index, para))
+                        _translation_element_failed()
                     else:
                         translated_count += 1
+                        _translation_element_succeeded()
                     # Translate normal memakai rentang 10%--90%, dihitung
                     # murni dari counter done/total (XXX/XXX).
                     pct = 10 + int(done / max(total, 1) * 80)
@@ -2120,7 +2108,7 @@ class DocxFinalTranslatorEngine:
             if recovery_total:
                 _notify(
                     progress_callback, 90,
-                    f"[pemulihan 1 worker] 0/{recovery_total} | berhasil=0 | gagal={recovery_total} | percobaan=mulai",
+                    f"[pemulihan 1 worker] 0/{recovery_total} | berhasil=0 | gagal={recovery_total} | status=mulai",
                 )
             for recovery_done, (index, para) in enumerate(
                     sorted(failed_paras, key=lambda item: item[0]), start=1):
@@ -2141,20 +2129,20 @@ class DocxFinalTranslatorEngine:
                     if not failed:
                         break
                     if recovery_attempt < 6:
-                        # Long cooldown only for provider/network failure. A partial
-                        # translation is retried quickly and must not stall recovery.
-                        last_preview = recovery_tr.failed_texts[-1] if recovery_tr.failed_texts else ''
-                        time.sleep(0.12 + random.uniform(0.0, 0.12))
+                        # Tanpa sleep tetap; adaptive gate sendiri yang mengatur
+                        # jeda hanya bila elemen sebelumnya benar-benar gagal.
                         recovery_tr = _Translator(
                             self.source_lang, self.target_lang,
                             self.custom_dict, self.italic_dict,
                         )
                 if failed:
                     still_failed.append(para)
+                    _translation_element_failed()
                 else:
                     recovery_success += 1
                     translated_count += 1
                     italic_count += len(found)
+                    _translation_element_succeeded()
                 # Pemulihan memakai rentang 90%--98%, dihitung murni dari
                 # counter recovery_done/recovery_total (YY/YY).
                 pct = 90 + int(recovery_done / max(recovery_total, 1) * 8)
@@ -2162,7 +2150,7 @@ class DocxFinalTranslatorEngine:
                     progress_callback, pct,
                     f"[pemulihan 1 worker] {recovery_done}/{recovery_total} | "
                     f"berhasil={recovery_success} | "
-                    f"gagal={len(still_failed)} "
+                    f"gagal={recovery_total - recovery_success} "
                     f"| [progres-total] {total + recovery_done}/"
                     f"{total + recovery_total}",
                 )
