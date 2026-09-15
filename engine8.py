@@ -21,6 +21,9 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import os
+import json
+import hashlib
+import threading
 
 from docx import Document
 from docx.shared import Pt
@@ -65,6 +68,161 @@ _HEADING_STYLES_WITH_NUM = {
     'Heading4', 'Heading5', 'Heading6',
 }
 _TRANSLATE_DELAY = 0.15
+
+# Cache terjemahan persisten + mekanisme adaptif.
+# Cache dibaca SEBELUM request ke provider. Karena token proteksi Engine 8
+# memakai UUID yang berubah setiap paragraf, key/value cache dinormalisasi agar
+# cache tetap hit walaupun token aktual berbeda pada proses berikutnya.
+_CACHE_FILE = os.getenv(
+    'RSNI_TRANSLATION_CACHE',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'translation_cache.json'),
+)
+_CACHE_MAX_ITEMS = int(os.getenv('RSNI_TRANSLATION_CACHE_MAX', '50000'))
+_CACHE_LOCK = threading.RLock()
+_CACHE_MEMORY = None
+
+
+def _load_translation_cache() -> dict:
+    global _CACHE_MEMORY
+    with _CACHE_LOCK:
+        if _CACHE_MEMORY is not None:
+            return _CACHE_MEMORY
+        try:
+            with open(_CACHE_FILE, 'r', encoding='utf-8') as fh:
+                data = json.load(fh)
+            _CACHE_MEMORY = data if isinstance(data, dict) else {}
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            _CACHE_MEMORY = {}
+        return _CACHE_MEMORY
+
+
+def _save_translation_cache() -> None:
+    with _CACHE_LOCK:
+        cache = _load_translation_cache()
+        if len(cache) > _CACHE_MAX_ITEMS:
+            # dict mempertahankan insertion-order: buang entri paling lama.
+            excess = len(cache) - _CACHE_MAX_ITEMS
+            for key in list(cache)[:excess]:
+                cache.pop(key, None)
+        tmp = _CACHE_FILE + '.tmp'
+        try:
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump(cache, fh, ensure_ascii=False, separators=(',', ':'))
+            os.replace(tmp, _CACHE_FILE)
+        except OSError:
+            # Cache adalah optimasi; kegagalan menulis cache tidak boleh
+            # menggagalkan dokumen.
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _cache_canonicalize(text: str):
+    """Ubah token UUID menjadi placeholder stabil untuk key/value cache."""
+    actual_tokens = _RE_PROTECTION_TOKEN.findall(text)
+    actual_to_placeholder = {}
+    placeholder_to_actual = {}
+    counters = {'TK': 0, 'IT': 0, 'SRC': 0}
+    for token in actual_tokens:
+        m = re.match(r'ZXQ(TK|IT|SRC)', token, re.IGNORECASE)
+        kind = m.group(1).upper() if m else 'TK'
+        key = token.casefold()
+        if key not in actual_to_placeholder:
+            idx = counters[kind]
+            counters[kind] += 1
+            placeholder = f'__RSNI_{kind}_{idx:04d}__'
+            actual_to_placeholder[key] = placeholder
+            placeholder_to_actual[placeholder] = token
+    canonical = text
+    # replace via regex agar case token tidak menjadi masalah
+    canonical = _RE_PROTECTION_TOKEN.sub(
+        lambda m: actual_to_placeholder.get(m.group(0).casefold(), m.group(0)),
+        canonical,
+    )
+    return canonical, placeholder_to_actual, actual_to_placeholder
+
+
+def _cache_key(source: str, target: str, text: str) -> tuple[str, dict, dict]:
+    canonical, placeholder_to_actual, actual_to_placeholder = _cache_canonicalize(text)
+    payload = f'{source}\0{target}\0{canonical}'.encode('utf-8')
+    return hashlib.sha256(payload).hexdigest(), placeholder_to_actual, actual_to_placeholder
+
+
+def _cache_get(source: str, target: str, text: str):
+    key, placeholder_to_actual, _ = _cache_key(source, target, text)
+    with _CACHE_LOCK:
+        cached = _load_translation_cache().get(key)
+    if not isinstance(cached, str):
+        return None
+    result = cached
+    for placeholder, actual in placeholder_to_actual.items():
+        result = result.replace(placeholder, actual)
+    return result
+
+
+def _cache_put(source: str, target: str, source_text: str, translated: str) -> None:
+    key, _, source_actual_to_placeholder = _cache_key(source, target, source_text)
+    canonical_result = translated
+    canonical_result = _RE_PROTECTION_TOKEN.sub(
+        lambda m: source_actual_to_placeholder.get(m.group(0).casefold(), m.group(0)),
+        canonical_result,
+    )
+    with _CACHE_LOCK:
+        cache = _load_translation_cache()
+        cache[key] = canonical_result
+        _save_translation_cache()
+
+
+class _AdaptiveTranslationController:
+    """Mode normal -> adaptif saat gagal; normal lagi setelah 2 sukses beruntun.
+
+    Saat adaptif, request provider diserialkan dan diberi jeda kecil. Tujuannya
+    menurunkan burst/rate-limit hanya ketika memang ada kegagalan. Dua request
+    provider yang sukses berturut-turut mengembalikan ke mode normal 4-worker.
+    Cache hit tidak dihitung sebagai sukses provider agar mode tidak pulih palsu.
+    """
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._adaptive_gate = threading.Lock()
+        self.adaptive = False
+        self.success_streak = 0
+        self.failures = 0
+
+    def is_adaptive(self) -> bool:
+        with self._lock:
+            return self.adaptive
+
+    def before_provider(self):
+        if self.is_adaptive():
+            self._adaptive_gate.acquire()
+            time.sleep(0.65)
+            return True
+        return False
+
+    def after_provider(self, success: bool, gate_acquired: bool = False):
+        try:
+            with self._lock:
+                if success:
+                    if self.adaptive:
+                        self.success_streak += 1
+                        if self.success_streak >= 2:
+                            self.adaptive = False
+                            self.success_streak = 0
+                    else:
+                        self.success_streak = 0
+                else:
+                    self.failures += 1
+                    self.adaptive = True
+                    self.success_streak = 0
+        finally:
+            if gate_acquired:
+                self._adaptive_gate.release()
+
+    def snapshot(self):
+        with self._lock:
+            return self.adaptive, self.success_streak, self.failures
 _EM_DASH = '—'
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1140,7 +1298,8 @@ class TranslationFailedError(RuntimeError):
 class _Translator:
     def __init__(self, source: str = 'auto', target: str = 'id', 
                  custom_dict: CustomDictionary | None = None,
-                 italic_dict: ItalicDictionary | None = None):
+                 italic_dict: ItalicDictionary | None = None,
+                 adaptive_controller: _AdaptiveTranslationController | None = None):
         try: from deep_translator import GoogleTranslator
         except ImportError: raise ImportError("Jalankan: pip install deep-translator")
         self._cls = GoogleTranslator
@@ -1148,6 +1307,9 @@ class _Translator:
         self.custom_dict = custom_dict; self.italic_dict = italic_dict
         self._client = self._cls(source=self.source, target=self.target)
         self.failed_texts: list[str] = []
+        self.adaptive_controller = adaptive_controller or _AdaptiveTranslationController()
+        self.cache_hits = 0
+        self.provider_calls = 0
 
     def translate_one(self, text: str, italic_map: dict = None) -> tuple[str, list[str]]:
         t = text.strip()
@@ -1176,34 +1338,63 @@ class _Translator:
         expected_tokens = {
             token.casefold() for token in _RE_PROTECTION_TOKEN.findall(t)
         }
-        result = None
-        last_error = None
-        for attempt in range(1, 5):
-            try:
-                candidate = self._client.translate(t)
-                if not candidate or _looks_like_error_response(t, candidate):
-                    raise ValueError('respons layanan terjemahan tidak valid')
-                returned_tokens = {
-                    token.casefold()
-                    for token in _RE_PROTECTION_TOKEN.findall(candidate)
-                }
-                if returned_tokens != expected_tokens:
-                    raise ValueError('token kamus/format berubah atau hilang')
 
-                source_plain = _RE_PROTECTION_TOKEN.sub('', t)
-                result_plain = _RE_PROTECTION_TOKEN.sub('', candidate)
-                if (
-                    re.search(r'[A-Za-z]{3}', source_plain)
-                    and re.sub(r'\s+', ' ', source_plain).strip().casefold()
-                    == re.sub(r'\s+', ' ', result_plain).strip().casefold()
-                ):
-                    raise ValueError('teks dikembalikan tanpa diterjemahkan')
-                result = candidate
-                break
-            except Exception as exc:
-                last_error = exc
-                if attempt < 4:
-                    time.sleep(0.8 * attempt)
+        # CACHE FIRST: hanya jika hasil cache valid dan semua token proteksi
+        # tetap lengkap. Jika miss/invalid, barulah request ke translator.
+        cached = _cache_get(self.source, self.target, t)
+        if cached and not _looks_like_error_response(t, cached):
+            cached_tokens = {
+                token.casefold() for token in _RE_PROTECTION_TOKEN.findall(cached)
+            }
+            if cached_tokens == expected_tokens:
+                self.cache_hits += 1
+                result = cached
+            else:
+                result = None
+        else:
+            result = None
+        last_error = None
+        if result is None:
+            for attempt in range(1, 5):
+                gate_acquired = self.adaptive_controller.before_provider()
+                request_success = False
+                try:
+                    self.provider_calls += 1
+                    candidate = self._client.translate(t)
+                    if not candidate or _looks_like_error_response(t, candidate):
+                        raise ValueError('respons layanan terjemahan tidak valid')
+                    returned_tokens = {
+                        token.casefold()
+                        for token in _RE_PROTECTION_TOKEN.findall(candidate)
+                    }
+                    if returned_tokens != expected_tokens:
+                        raise ValueError('token kamus/format berubah atau hilang')
+
+                    source_plain = _RE_PROTECTION_TOKEN.sub('', t)
+                    result_plain = _RE_PROTECTION_TOKEN.sub('', candidate)
+                    if (
+                        re.search(r'[A-Za-z]{3}', source_plain)
+                        and re.sub(r'\s+', ' ', source_plain).strip().casefold()
+                        == re.sub(r'\s+', ' ', result_plain).strip().casefold()
+                    ):
+                        raise ValueError('teks dikembalikan tanpa diterjemahkan')
+                    result = candidate
+                    request_success = True
+                    _cache_put(self.source, self.target, t, result)
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    # Client baru membantu saat koneksi/provider sedang tidak
+                    # sehat. Delay lebih besar hanya aktif di mode adaptif.
+                    try:
+                        self._client = self._cls(source=self.source, target=self.target)
+                    except Exception:
+                        pass
+                    if attempt < 4:
+                        delay = (1.2 * attempt) if self.adaptive_controller.is_adaptive() else (0.35 * attempt)
+                        time.sleep(delay)
+                finally:
+                    self.adaptive_controller.after_provider(request_success, gate_acquired)
 
         if result is None:
             # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
@@ -1719,7 +1910,8 @@ class DocxFinalTranslatorEngine:
             _notify(progress_callback, 5, "Init translator...")
             # Satu instance translator tidak dibagi lintas thread. Setiap worker
             # memiliki client sendiri agar aman dan benar-benar berjalan paralel.
-            tr = _Translator(self.source_lang, self.target_lang, self.custom_dict, self.italic_dict)
+            adaptive_controller = _AdaptiveTranslationController()
+            tr = _Translator(self.source_lang, self.target_lang, self.custom_dict, self.italic_dict, adaptive_controller)
             doc = Document(input_docx)
 
             scan_started = time.perf_counter()
@@ -1745,22 +1937,27 @@ class DocxFinalTranslatorEngine:
             done = translated_count = 0
             italic_count = 0
             failed_paras = []
+            cache_hits = 0
+            provider_calls = 0
 
             def _translate_job(index_para):
                 index, para = index_para
                 worker_tr = _Translator(
                     self.source_lang, self.target_lang,
-                    self.custom_dict, self.italic_dict,
+                    self.custom_dict, self.italic_dict, adaptive_controller,
                 )
                 found = _translate_para(para, worker_tr)
-                return index, para, found, bool(worker_tr.failed_texts)
+                return (index, para, found, bool(worker_tr.failed_texts),
+                        worker_tr.cache_hits, worker_tr.provider_calls)
 
             # Tahap utama: tepat 4 worker translate.
             with ThreadPoolExecutor(max_workers=4, thread_name_prefix='translate') as pool:
                 futures = [pool.submit(_translate_job, item)
                            for item in enumerate(translation_queue)]
                 for future in as_completed(futures):
-                    index, para, found, failed = future.result()
+                    index, para, found, failed, job_cache_hits, job_provider_calls = future.result()
+                    cache_hits += job_cache_hits
+                    provider_calls += job_provider_calls
                     done += 1
                     italic_count += len(found)
                     if failed:
@@ -1775,6 +1972,9 @@ class DocxFinalTranslatorEngine:
                         f"[translate 4 worker] {done}/{total} | "
                         f"berhasil={translated_count} | "
                         f"gagal={len(failed_paras)} | "
+                        f"cache={cache_hits} | provider={provider_calls} | "
+                        f"mode={'ADAPTIF' if adaptive_controller.snapshot()[0] else 'NORMAL'} "
+                        f"(sukses-beruntun={adaptive_controller.snapshot()[1]}/2) | "
                         f"[progres-total] {done}/{total + len(failed_paras)}",
                     )
 
@@ -1785,7 +1985,7 @@ class DocxFinalTranslatorEngine:
             recovery_success = 0
             recovery_tr = _Translator(
                 self.source_lang, self.target_lang,
-                self.custom_dict, self.italic_dict,
+                self.custom_dict, self.italic_dict, adaptive_controller,
             )
             for recovery_done, (index, para) in enumerate(
                     sorted(failed_paras, key=lambda item: item[0]), start=1):
@@ -1806,6 +2006,9 @@ class DocxFinalTranslatorEngine:
                     f"[pemulihan 1 worker] {recovery_done}/{recovery_total} | "
                     f"berhasil={recovery_success} | "
                     f"gagal={recovery_total - recovery_done + len(still_failed)} "
+                    f"| cache={cache_hits + recovery_tr.cache_hits} "
+                    f"| mode={'ADAPTIF' if adaptive_controller.snapshot()[0] else 'NORMAL'} "
+                    f"(sukses-beruntun={adaptive_controller.snapshot()[1]}/2) "
                     f"| [progres-total] {total + recovery_done}/"
                     f"{total + recovery_total}",
                 )
@@ -1850,7 +2053,8 @@ class DocxFinalTranslatorEngine:
             summary += (
                 f" Paragraf diterjemahkan: {translated_count}; "
                 f"unit diperiksa: {inspected_count}; "
-                f"zona/unit di-skip pra-scan: {skipped_count}."
+                f"zona/unit di-skip pra-scan: {skipped_count}; "
+                f"cache hit: {cache_hits + recovery_tr.cache_hits}."
             )
             if tr.failed_texts:
                 summary += (
