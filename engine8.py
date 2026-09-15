@@ -1150,6 +1150,9 @@ _TRANSLATION_CACHE_PATH = os.getenv(
 )
 _CACHE_INIT_LOCK = threading.Lock()
 _CACHE_READY = False
+_RAM_CACHE = {}
+_RAM_CACHE_LOCK = threading.RLock()
+_RAM_CACHE_MAX = 10000
 
 
 def _cache_init() -> None:
@@ -1177,6 +1180,9 @@ def _cache_init() -> None:
                 con.close()
         except Exception:
             _CACHE_READY = False
+_RAM_CACHE = {}
+_RAM_CACHE_LOCK = threading.RLock()
+_RAM_CACHE_MAX = 10000
 
 
 def _dictionary_fingerprint(custom_dict) -> str:
@@ -1215,6 +1221,14 @@ def _cache_identity(text: str, italic_map: dict, source: str, target: str,
 
 
 def _cache_get(cache_key: str, src_tokens: list[str]):
+    # L1: RAM cache -- no SQLite I/O for repeated text in the same live process.
+    with _RAM_CACHE_LOCK:
+        row = _RAM_CACHE.get(cache_key)
+    if row is not None:
+        translated = _restore_source_tokens(row[0], src_tokens)
+        return translated, list(row[1])
+
+    # L2: persistent SQLite cache.
     _cache_init()
     if not _CACHE_READY:
         return None
@@ -1229,11 +1243,15 @@ def _cache_get(cache_key: str, src_tokens: list[str]):
                 return None
             con.execute('UPDATE translation_cache SET hits=hits+1 WHERE cache_key=?', (cache_key,))
             con.commit()
-            translated = _restore_source_tokens(row[0], src_tokens)
             try:
                 terms = json.loads(row[1])
             except Exception:
                 terms = []
+            with _RAM_CACHE_LOCK:
+                if len(_RAM_CACHE) >= _RAM_CACHE_MAX:
+                    _RAM_CACHE.pop(next(iter(_RAM_CACHE)), None)
+                _RAM_CACHE[cache_key] = (row[0], tuple(terms))
+            translated = _restore_source_tokens(row[0], src_tokens)
             return translated, terms
         finally:
             con.close()
@@ -1241,12 +1259,33 @@ def _cache_get(cache_key: str, src_tokens: list[str]):
         return None
 
 
+def _cache_delete(cache_key: str) -> None:
+    # Used when an old cache entry is detected as partial/mixed translation.
+    with _RAM_CACHE_LOCK:
+        _RAM_CACHE.pop(cache_key, None)
+    _cache_init()
+    if not _CACHE_READY:
+        return
+    try:
+        con = sqlite3.connect(_TRANSLATION_CACHE_PATH, timeout=5)
+        try:
+            con.execute('DELETE FROM translation_cache WHERE cache_key=?', (cache_key,))
+            con.commit()
+        finally:
+            con.close()
+    except Exception:
+        pass
+
 def _cache_put(cache_key: str, translated: str, italic_terms: list[str]) -> None:
     _cache_init()
     if not _CACHE_READY:
         return
     try:
         canonical, _ = _canonicalize_source_tokens(translated)
+        with _RAM_CACHE_LOCK:
+            if len(_RAM_CACHE) >= _RAM_CACHE_MAX:
+                _RAM_CACHE.pop(next(iter(_RAM_CACHE)), None)
+            _RAM_CACHE[cache_key] = (canonical, tuple(italic_terms or []))
         con = sqlite3.connect(_TRANSLATION_CACHE_PATH, timeout=5)
         try:
             con.execute("""INSERT INTO translation_cache(cache_key, translated, italic_terms, created_at, hits)
@@ -1320,6 +1359,35 @@ def _translation_gate_success() -> None:
             _TRANSLATE_ADAPTIVE_UNTIL = 0.0
             _TRANSLATE_NEXT_REQUEST = min(_TRANSLATE_NEXT_REQUEST, time.monotonic() + _TRANSLATE_FAST_INTERVAL)
 
+_ENGLISH_RESIDUAL_PHRASES = (
+    'these can be', 'these dapat be', 'can be represented', 'be represented by',
+    'a flaming source', 'generating a radiant flux', 'nominal value in the range',
+    'applied to an area', 'with an average power', 'for a period of',
+    'followed immediately by', 'applied to the same', 'with the objectives of',
+    'in the event of', 'in accordance with', 'such declarations should',
+)
+_ENGLISH_FUNCTION_WORDS = {
+    'the','these','this','that','can','could','should','would','be','been','being',
+    'by','with','from','for','of','to','in','on','at','and','or','an','a','same',
+    'followed','immediately','applied','represented','generating','range','period',
+}
+
+def _translation_has_residual_english(source: str, translated: str) -> bool:
+    """Detect obvious partial English output without rejecting technical terms/units."""
+    src = re.sub(r'ZXQ[A-Z0-9]+QXZ|@@[^@]+@@', ' ', source or '', flags=re.I)
+    out = re.sub(r'ZXQ[A-Z0-9]+QXZ|@@[^@]+@@', ' ', translated or '', flags=re.I)
+    if not re.search(r'[A-Za-z]{3}', src):
+        return False
+    low = re.sub(r'\s+', ' ', out).strip().casefold()
+    if any(phrase in low for phrase in _ENGLISH_RESIDUAL_PHRASES):
+        return True
+    words = re.findall(r"[a-z]+", low)
+    if len(words) < 8:
+        return False
+    hits = sum(w in _ENGLISH_FUNCTION_WORDS for w in words)
+    # Conservative threshold: only obvious mixed/mostly-English results are retried.
+    return hits >= 6 and (hits / max(len(words), 1)) >= 0.22
+
 class _Translator:
     def __init__(self, source: str = 'auto', target: str = 'id', 
                  custom_dict: CustomDictionary | None = None,
@@ -1343,7 +1411,10 @@ class _Translator:
         )
         cached = _cache_get(cache_key, cache_src_tokens)
         if cached is not None:
-            return cached
+            if not _translation_has_residual_english(t, cached[0]):
+                return cached
+            # Old partial translations must never poison future runs.
+            _cache_delete(cache_key)
 
         token_map = {}
         if self.custom_dict and len(self.custom_dict) > 0:
@@ -1393,6 +1464,8 @@ class _Translator:
                     == re.sub(r'\s+', ' ', result_plain).strip().casefold()
                 ):
                     raise ValueError('teks dikembalikan tanpa diterjemahkan')
+                if _translation_has_residual_english(t, candidate):
+                    raise ValueError('hasil masih mengandung residu bahasa Inggris')
                 result = candidate
                 _translation_gate_success()
                 break
@@ -1435,6 +1508,34 @@ class _Translator:
                 except TranslationFailedError as split_error:
                     last_error = split_error
 
+        if result is None and len(t) > 240:
+            # Long technical NOTE/paragraph fallback. Some providers return a
+            # partially translated long sentence without raising an exception.
+            # Split only at whitespace/punctuation boundaries, translate each
+            # chunk independently, then reassemble. Protection tokens are never
+            # cut because they contain no whitespace.
+            words = re.findall(r'\S+\s*', t)
+            chunks, current = [], ''
+            for word in words:
+                if current and len(current) + len(word) > 220:
+                    chunks.append(current.rstrip())
+                    current = word
+                else:
+                    current += word
+            if current.strip():
+                chunks.append(current.rstrip())
+            if len(chunks) > 1:
+                try:
+                    translated_chunks = []
+                    for chunk in chunks:
+                        chunk_result, _ = self.translate_one(chunk, {})
+                        if _translation_has_residual_english(chunk, chunk_result):
+                            raise TranslationFailedError('chunk masih mengandung residu bahasa Inggris')
+                        translated_chunks.append(chunk_result.strip())
+                    result = ' '.join(translated_chunks)
+                except TranslationFailedError as chunk_error:
+                    last_error = chunk_error
+
         if result is None:
             # Provider cadangan untuk kondisi Google Translate sedang menolak
             # request/rate-limited. Deep-translator menyertakan MyMemory;
@@ -1450,7 +1551,8 @@ class _Translator:
                 fallback = MyMemoryTranslator(
                     source=fallback_source, target=fallback_target
                 ).translate(t)
-                if fallback and not _looks_like_error_response(t, fallback):
+                if (fallback and not _looks_like_error_response(t, fallback)
+                        and not _translation_has_residual_english(t, fallback)):
                     fallback_tokens = {
                         token.casefold()
                         for token in _RE_PROTECTION_TOKEN.findall(fallback)
@@ -2004,25 +2106,45 @@ class DocxFinalTranslatorEngine:
             # Hanya bagian yang belum berhasil diterjemahkan yang diulang,
             # secara berurutan dengan tepat 1 worker.
             recovery_total = len(failed_paras)
+            if recovery_total == 0:
+                _notify(
+                    progress_callback, 90,
+                    "[pemulihan 1 worker] 0/0 | berhasil=0 | gagal=0 | tidak diperlukan",
+                )
             still_failed = []
             recovery_success = 0
             recovery_tr = _Translator(
                 self.source_lang, self.target_lang,
                 self.custom_dict, self.italic_dict,
             )
+            if recovery_total:
+                _notify(
+                    progress_callback, 90,
+                    f"[pemulihan 1 worker] 0/{recovery_total} | berhasil=0 | gagal={recovery_total} | percobaan=mulai",
+                )
             for recovery_done, (index, para) in enumerate(
                     sorted(failed_paras, key=lambda item: item[0]), start=1):
                 found = []
                 failed = True
                 # Tetap tepat 1 worker; tiga retry ini berlangsung sekuensial.
                 for recovery_attempt in range(1, 7):
+                    _notify(
+                        progress_callback,
+                        90 + int((recovery_done - 1) / max(recovery_total, 1) * 8),
+                        f"[pemulihan 1 worker] {recovery_done - 1}/{recovery_total} | "
+                        f"berhasil={recovery_success} | gagal={recovery_total - recovery_success} | "
+                        f"percobaan={recovery_attempt}/6",
+                    )
                     before = len(recovery_tr.failed_texts)
                     found = _translate_para(para, recovery_tr)
                     failed = len(recovery_tr.failed_texts) > before
                     if not failed:
                         break
                     if recovery_attempt < 6:
-                        time.sleep(min(15.0, 2.0 * recovery_attempt) + random.uniform(0.2, 0.8))
+                        # Long cooldown only for provider/network failure. A partial
+                        # translation is retried quickly and must not stall recovery.
+                        last_preview = recovery_tr.failed_texts[-1] if recovery_tr.failed_texts else ''
+                        time.sleep(0.12 + random.uniform(0.0, 0.12))
                         recovery_tr = _Translator(
                             self.source_lang, self.target_lang,
                             self.custom_dict, self.italic_dict,
