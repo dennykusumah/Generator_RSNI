@@ -21,6 +21,14 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import os
+import threading
+
+# RAM-only translation cache. Hilang otomatis saat proses Streamlit restart.
+_RAM_TRANSLATION_CACHE: dict[tuple[str, str, str], str] = {}
+_RAM_CACHE_LOCK = threading.RLock()
+_ADAPTIVE_LOCK = threading.RLock()
+_ADAPTIVE_MODE = False
+_ADAPTIVE_SUCCESS_STREAK = 0
 
 from docx import Document
 from docx.shared import Pt
@@ -1137,6 +1145,76 @@ class TranslationFailedError(RuntimeError):
     """Mencegah dokumen setengah diterjemahkan tetap disimpan."""
 
 
+def _canonicalize_cache_tokens(text: str) -> tuple[str, list[str]]:
+    """Normalkan token UUID agar cache RAM reusable antar percobaan."""
+    tokens = _RE_PROTECTION_TOKEN.findall(text or '')
+    counters = {'TK': 0, 'IT': 0, 'SRC': 0}
+    canonical = text or ''
+    for token in tokens:
+        m = re.match(r'ZXQ(TK|IT|SRC)', token, re.I)
+        kind = (m.group(1) if m else 'SRC').upper()
+        counters[kind] += 1
+        repl = f'ZXQ{kind}{counters[kind]:012X}QXZ'
+        canonical = re.sub(re.escape(token), repl, canonical, count=1, flags=re.I)
+    return canonical, tokens
+
+
+def _restore_cache_tokens(text: str, current_tokens: list[str]) -> str:
+    counters = {'TK': 0, 'IT': 0, 'SRC': 0}
+    out = text
+    for token in current_tokens:
+        m = re.match(r'ZXQ(TK|IT|SRC)', token, re.I)
+        kind = (m.group(1) if m else 'SRC').upper()
+        counters[kind] += 1
+        canonical = f'ZXQ{kind}{counters[kind]:012X}QXZ'
+        out = re.sub(re.escape(canonical), token, out, count=1, flags=re.I)
+    return out
+
+
+def _suspicious_english_residue(source: str, translated: str, target: str) -> bool:
+    """Tolak hasil campuran seperti 'These dapat be represented ...'."""
+    if target != 'id':
+        return False
+    common = {
+        'the','these','this','can','be','represented','by','a','an','of','in','to',
+        'from','with','for','and','or','is','are','was','were','applied','area',
+        'average','power','output','period','followed','immediately','same','source',
+        'generating','radiant','flux','nominal','value','range','flaming'
+    }
+    src = set(re.findall(r"[A-Za-z]{2,}", _RE_PROTECTION_TOKEN.sub('', source).lower()))
+    dst = set(re.findall(r"[A-Za-z]{2,}", _RE_PROTECTION_TOKEN.sub('', translated).lower()))
+    survivors = src & dst & common
+    return len(survivors) >= 4
+
+
+def _split_translation_chunks(text: str, max_chars: int = 180) -> list[str]:
+    """Pecah teks panjang tanpa memotong token proteksi."""
+    if len(text) <= max_chars:
+        return [text]
+    atoms = re.split(r'(ZXQ(?:TK|IT|SRC)[A-F0-9]{12}QXZ)', text, flags=re.I)
+    chunks, buf = [], ''
+    for atom in atoms:
+        if not atom:
+            continue
+        if _RE_PROTECTION_TOKEN.fullmatch(atom):
+            if len(buf) + len(atom) > max_chars and buf.strip():
+                chunks.append(buf); buf = ''
+            buf += atom
+            continue
+        # Pecah di batas frasa/kalimat/whitespace terdekat.
+        pieces = re.split(r'(?<=[.;:])\s+|(?=\s+(?:followed immediately by|with an average|applied to)\s+)', atom, flags=re.I)
+        for piece in pieces:
+            if not piece:
+                continue
+            if len(buf) + len(piece) <= max_chars:
+                buf += piece
+            else:
+                if buf.strip(): chunks.append(buf)
+                buf = piece
+    if buf.strip(): chunks.append(buf)
+    return chunks or [text]
+
+
 class _Translator:
     def __init__(self, source: str = 'auto', target: str = 'id', 
                  custom_dict: CustomDictionary | None = None,
@@ -1150,12 +1228,28 @@ class _Translator:
         self.failed_texts: list[str] = []
 
     def translate_one(self, text: str, italic_map: dict = None) -> tuple[str, list[str]]:
+        global _ADAPTIVE_MODE, _ADAPTIVE_SUCCESS_STREAK
         t = text.strip()
         if not t or _skip_text(t): return text, []
         token_map = {}
         if self.custom_dict and len(self.custom_dict) > 0:
             t, token_map = self.custom_dict._apply_pre(t)
         final_italic_map = italic_map or {}
+
+        # CACHE-FIRST, RAM ONLY. Token UUID dinormalisasi agar cache tetap
+        # cocok pada retry/pemulihan walaupun token proteksi dibuat ulang.
+        cache_text, current_tokens = _canonicalize_cache_tokens(t)
+        cache_key = (self.source, self.target, cache_text)
+        with _RAM_CACHE_LOCK:
+            cached = _RAM_TRANSLATION_CACHE.get(cache_key)
+        if cached is not None:
+            result = _restore_cache_tokens(cached, current_tokens)
+            if token_map: result = self.custom_dict._apply_post(result, token_map)
+            italic_terms_found = []
+            if final_italic_map:
+                _idict = self.italic_dict if self.italic_dict is not None else ItalicDictionary()
+                result, italic_terms_found = _idict._apply_post(result, final_italic_map)
+            return result, italic_terms_found
 
         # Jika seluruh teks sudah dicakup Kamus SNI, hasil kamus adalah hasil
         # final. Ini berlaku untuk satu token ("Introduction") maupun beberapa
@@ -1180,9 +1274,15 @@ class _Translator:
         last_error = None
         for attempt in range(1, 5):
             try:
+                with _ADAPTIVE_LOCK:
+                    adaptive_now = _ADAPTIVE_MODE
+                if adaptive_now:
+                    time.sleep(0.65)
                 candidate = self._client.translate(t)
                 if not candidate or _looks_like_error_response(t, candidate):
                     raise ValueError('respons layanan terjemahan tidak valid')
+                if _suspicious_english_residue(t, candidate, self.target):
+                    raise ValueError('hasil terjemahan masih bercampur teks Inggris')
                 returned_tokens = {
                     token.casefold()
                     for token in _RE_PROTECTION_TOKEN.findall(candidate)
@@ -1202,8 +1302,39 @@ class _Translator:
                 break
             except Exception as exc:
                 last_error = exc
+                with _ADAPTIVE_LOCK:
+                    _ADAPTIVE_MODE = True
+                    _ADAPTIVE_SUCCESS_STREAK = 0
+                try:
+                    self._client = self._cls(source=self.source, target=self.target)
+                except Exception:
+                    pass
                 if attempt < 4:
                     time.sleep(0.8 * attempt)
+
+        if result is not None:
+            with _ADAPTIVE_LOCK:
+                if _ADAPTIVE_MODE:
+                    _ADAPTIVE_SUCCESS_STREAK += 1
+                    if _ADAPTIVE_SUCCESS_STREAK >= 2:
+                        _ADAPTIVE_MODE = False
+                        _ADAPTIVE_SUCCESS_STREAK = 0
+
+        # Fallback penting untuk paragraf panjang (terutama NOTE/CATATAN dengan
+        # banyak superscript): pecah menjadi request kecil, tetapi token format
+        # tidak pernah dipotong. Ini mencegah satu NOTE panjang menggagalkan E8.
+        if result is None and len(t) > 180:
+            chunks = _split_translation_chunks(t, 180)
+            if len(chunks) > 1:
+                chunk_results = []
+                failed_before = len(self.failed_texts)
+                for chunk in chunks:
+                    part, _ = self.translate_one(chunk, {})
+                    chunk_results.append(part)
+                candidate = ''.join(chunk_results)
+                if (len(self.failed_texts) == failed_before and candidate and
+                        not _suspicious_english_residue(t, candidate, self.target)):
+                    result = candidate
 
         if result is None:
             # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
@@ -1262,10 +1393,14 @@ class _Translator:
         if result is None:
             preview = re.sub(r'\s+', ' ', text).strip()[:100]
             # Jangan gagalkan seluruh pipeline karena satu request eksternal.
-            # Simpan teks sumber (token kamus tetap dipulihkan di bawah) dan
-            # laporkan sebagai peringatan pada ringkasan proses.
             self.failed_texts.append(preview)
             result = t
+        else:
+            # Simpan hanya hasil yang benar-benar sukses. Cache RAM tidak pernah
+            # ditulis ke disk/GitHub dan otomatis hilang saat Streamlit restart.
+            canonical_result, _ = _canonicalize_cache_tokens(result)
+            with _RAM_CACHE_LOCK:
+                _RAM_TRANSLATION_CACHE[cache_key] = canonical_result
         if token_map: result = self.custom_dict._apply_post(result, token_map)
         italic_terms_found = []
         if final_italic_map:
